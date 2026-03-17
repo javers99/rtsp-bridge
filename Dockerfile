@@ -15,8 +15,9 @@ RUN npm install
 # Copy source code
 COPY . .
 
-# Expose the AudioSocket port
+# Expose the AudioSocket and RTP ports
 EXPOSE 8080
+EXPOSE 50000-50005/udp
 
 # Run the bridge
 CMD [ "node", "rtsp-direct.js" ]

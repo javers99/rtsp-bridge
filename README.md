@@ -31,8 +31,9 @@ Since TrueNAS SCALE supports Custom Docker Apps, you can run this bridge as a co
    - `REOLINK_PORT`: (Optional) The RTSP port (Default: `554`)
    - `RTSP_PATH`: (Optional) The specific RTSP sub-path (Default: `/h264Preview_01_sub`)
    - `LISTEN_PORT`: (Optional) The port for Asterisk to reach the bridge (Default: `8080`)
+   - `RTP_PORT`: (Optional) The starting UDP port for receiving media (Default: `50000`)
    - `BACKCHANNEL_GAIN`: (Optional) The gain applied to speaker audio (Default: `1.5`)
-7. **Networking**: Under Port Forwarding, forward the Node Port to Container Port `8080`.
+7. **Networking**: Under Port Forwarding, forward the Node Port to Container Port `8080` (TCP). Importantly, you must also forward UDP ports `50000` to `50005` on the Host Network to the Container to allow incoming Doorbell audio to work properly.
 8. Save and deploy.
 
 ### Option 2: Build directly on TrueNAS SCALE shell (If developer mode is enabled)

@@ -46,7 +46,7 @@ let isPlaying = false;
 let asteriskSocket = null;
 let rtspSocket = null;
 let tracks = []; // { type: 'audio'|'backchannel', control: '', setup: false, socket: dgram.Socket, remoteRtpPort: 0, remoteAddress: '' }
-let serverRtpPort = 50000;
+let serverRtpPort = parseInt(process.env.RTP_PORT || '50000');
 let incomingBuffer = Buffer.alloc(0);
 let lastSendTime = Date.now();
 let silenceInterval = null;
@@ -276,7 +276,7 @@ function stopRtsp() {
         }
     }
     tracks = [];
-    serverRtpPort = 50000;
+    serverRtpPort = parseInt(process.env.RTP_PORT || '50000');
     if (rtspSocket) {
         rtspSocket.destroy();
         rtspSocket = null;
@@ -296,11 +296,20 @@ function parseSdp(sdp) {
     for (let line of lines) {
         line = line.trim();
         if (line.startsWith('m=audio')) {
-            current = { type: 'audio', control: '', setup: false, codec: 'AAC' };
+            current = { type: 'audio', control: '', setup: false, codec: 'AAC', sampleRateIdx: 8 };
             tracks.push(current);
         } else if (line.startsWith('a=rtpmap:') && current) {
             if (line.includes('PCMU')) current.codec = 'PCMU';
             else if (line.includes('PCMA')) current.codec = 'PCMA';
+            else if (line.includes('MPEG4-GENERIC')) {
+                current.codec = 'AAC';
+                const match = line.match(/\/(\d+)/);
+                if (match) {
+                    const sr = parseInt(match[1]);
+                    const srMap = { 96000: 0, 88200: 1, 64000: 2, 48000: 3, 44100: 4, 32000: 5, 24000: 6, 22050: 7, 16000: 8, 12000: 9, 11025: 10, 8000: 11 };
+                    if (srMap[sr] !== undefined) current.sampleRateIdx = srMap[sr];
+                }
+            }
         } else if (line.startsWith('a=control:') && current) {
             const ctrl = line.substring(10);
             if (ctrl === '*') {
@@ -329,7 +338,6 @@ function setupTrack(track) {
     track.packetsRead = 0;
     track.decoder = null;
     track.encoder = null;
-    track.sampleRateIdx = 8; // Default 16000
     track.backPkts = 0;
 
     const socket = dgram.createSocket('udp4');
@@ -344,7 +352,22 @@ function setupTrack(track) {
 
     socket.on('message', (msg) => {
         if (msg.length <= 12) return;
-        const payload = msg.slice(12);
+
+        const version = (msg[0] & 0xC0) >> 6;
+        if (version !== 2) return;
+
+        const x = (msg[0] & 0x10) >> 4;
+        const cc = msg[0] & 0x0F;
+        let offset = 12 + (cc * 4);
+
+        if (x) {
+            if (msg.length < offset + 4) return;
+            const extLen = msg.readUInt16BE(offset + 2);
+            offset += 4 + (extLen * 4);
+        }
+
+        if (msg.length <= offset) return;
+        const payload = msg.slice(offset);
 
         // Verbose logging for first few packets
         if (track.packetsRead < 5) {
@@ -362,20 +385,30 @@ function setupTrack(track) {
                         '-f', 's16le', '-ac', '1', '-ar', '8000',
                         'pipe:1'
                     ]);
+                    track.pcmBuffer = Buffer.alloc(0);
                     track.decoder.stdout.on('data', (pcm) => {
-                        if (asteriskSocket && !asteriskSocket.destroyed) {
-                            const header = Buffer.from([0x10, (pcm.length >> 8) & 0xFF, pcm.length & 0xFF]);
-                            asteriskSocket.write(Buffer.concat([header, pcm]));
+                        if (!asteriskSocket || asteriskSocket.destroyed) return;
+                        track.pcmBuffer = Buffer.concat([track.pcmBuffer, pcm]);
+                        while (track.pcmBuffer.length >= 320) {
+                            const chunk = track.pcmBuffer.slice(0, 320);
+                            track.pcmBuffer = track.pcmBuffer.slice(320);
+                            const header = Buffer.from([0x10, (chunk.length >> 8) & 0xFF, chunk.length & 0xFF]);
+                            asteriskSocket.write(Buffer.concat([header, chunk]));
                             lastSendTime = Date.now();
                         }
                     });
                     track.decoder.on('error', (e) => log(`[Audio] Decoder error: ${e.message}`));
                 }
-                // Strip AU-Header (4 bytes) and add ADTS
-                if (payload.length > 4) {
-                    const aacFrame = payload.slice(4);
-                    const adts = getAdtsHeader(aacFrame.length, track.sampleRateIdx);
-                    track.decoder.stdin.write(Buffer.concat([adts, aacFrame]));
+                // Parse AU-Header
+                if (payload.length > 2) {
+                    const auHeadersLenBits = payload.readUInt16BE(0);
+                    const auHeadersLenBytes = Math.ceil(auHeadersLenBits / 8.0);
+                    const headerLen = 2 + auHeadersLenBytes;
+                    if (payload.length > headerLen) {
+                        const aacFrame = payload.slice(headerLen);
+                        const adts = getAdtsHeader(aacFrame.length, track.sampleRateIdx);
+                        track.decoder.stdin.write(Buffer.concat([adts, aacFrame]));
+                    }
                 }
             } else {
                 const outBuf = Buffer.alloc(payload.length * 2);
@@ -383,9 +416,17 @@ function setupTrack(track) {
                 for (let i = 0; i < payload.length; i++) {
                     outBuf.writeInt16LE(table[payload[i]], i * 2);
                 }
-                const header = Buffer.from([0x10, (outBuf.length >> 8) & 0xFF, outBuf.length & 0xFF]);
-                asteriskSocket.write(Buffer.concat([header, outBuf]));
-                lastSendTime = Date.now();
+                track.pcmBuffer = track.pcmBuffer || Buffer.alloc(0);
+                track.pcmBuffer = Buffer.concat([track.pcmBuffer, outBuf]);
+                while (track.pcmBuffer.length >= 320) {
+                    const chunk = track.pcmBuffer.slice(0, 320);
+                    track.pcmBuffer = track.pcmBuffer.slice(320);
+                    if (asteriskSocket && !asteriskSocket.destroyed) {
+                        const header = Buffer.from([0x10, (chunk.length >> 8) & 0xFF, chunk.length & 0xFF]);
+                        asteriskSocket.write(Buffer.concat([header, chunk]));
+                        lastSendTime = Date.now();
+                    }
+                }
             }
         }
     });
