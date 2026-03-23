@@ -231,12 +231,17 @@ function startRtsp() {
                     setupTrack(pending);
                 } else if (!isPlaying) {
                     isPlaying = true;
-                    // Extract base TS/Seq for backchannel if available
+                    // Establish base TS/Seq for backchannel - use random values if not provided
                     const info = resp.match(/url=rtsp:[^;]+track3;seq=(\d+);rtptime=(\d+)/);
                     if (info) {
                         baseSeq = parseInt(info[1]);
                         baseTs = parseInt(info[2]);
-                        log(`[RTSP] Backchannel base: seq=${baseSeq} ts=${baseTs}`);
+                        log(`[RTSP] Backchannel base from server: seq=${baseSeq} ts=${baseTs}`);
+                    } else {
+                        // Initialize with reasonable defaults to avoid lag waiting for setup
+                        baseSeq = Math.floor(Math.random() * 0x10000);
+                        baseTs = Math.floor(Math.random() * 0x100000000);
+                        log(`[RTSP] Backchannel base initialized: seq=${baseSeq} ts=${baseTs}`);
                     }
                     sendRtsp('PLAY', BASE_URL, { 'Require': 'www.onvif.org/ver20/backchannel' });
 
@@ -342,7 +347,19 @@ function setupTrack(track) {
 
     const socket = dgram.createSocket('udp4');
     socket.on('error', (e) => log(`[UDP] Socket error on track ${track.type}: ${e.message}`));
-    socket.bind(rtpPort);
+    socket.bind(rtpPort, () => {
+        // Optimize UDP socket for low latency
+        try {
+            socket.setRecvBufferSize(65536); // 64KB buffer
+        } catch (e) {
+            log(`[UDP] Could not set recv buffer size: ${e.message}`);
+        }
+        try {
+            socket.setSendBufferSize(65536); // 64KB buffer
+        } catch (e) {
+            log(`[UDP] Could not set send buffer size: ${e.message}`);
+        }
+    });
     track.socket = socket;
 
     const headers = { 'Transport': `RTP/AVP;unicast;client_port=${rtpPort}-${rtpPort + 1}` };
@@ -377,37 +394,18 @@ function setupTrack(track) {
 
         if (track.type === 'audio' && asteriskSocket && !asteriskSocket.destroyed) {
             if (track.codec === 'AAC') {
-                if (!track.decoder) {
-                    log(`[Audio] Starting AAC decoder (ffmpeg)`);
-                    track.decoder = spawn(FFMPEG_PATH, [
-                        '-f', 'aac',
-                        '-i', 'pipe:0',
-                        '-f', 's16le', '-ac', '1', '-ar', '8000',
-                        'pipe:1'
-                    ]);
-                    track.pcmBuffer = Buffer.alloc(0);
-                    track.decoder.stdout.on('data', (pcm) => {
-                        if (!asteriskSocket || asteriskSocket.destroyed) return;
-                        track.pcmBuffer = Buffer.concat([track.pcmBuffer, pcm]);
-                        while (track.pcmBuffer.length >= 320) {
-                            const chunk = track.pcmBuffer.slice(0, 320);
-                            track.pcmBuffer = track.pcmBuffer.slice(320);
-                            const header = Buffer.from([0x10, (chunk.length >> 8) & 0xFF, chunk.length & 0xFF]);
-                            asteriskSocket.write(Buffer.concat([header, chunk]));
-                            lastSendTime = Date.now();
+                // Decoder pre-spawned on connection; just send data
+                if (track.decoder) {
+                    // Parse AU-Header
+                    if (payload.length > 2) {
+                        const auHeadersLenBits = payload.readUInt16BE(0);
+                        const auHeadersLenBytes = Math.ceil(auHeadersLenBits / 8.0);
+                        const headerLen = 2 + auHeadersLenBytes;
+                        if (payload.length > headerLen) {
+                            const aacFrame = payload.slice(headerLen);
+                            const adts = getAdtsHeader(aacFrame.length, track.sampleRateIdx);
+                            track.decoder.stdin.write(Buffer.concat([adts, aacFrame]));
                         }
-                    });
-                    track.decoder.on('error', (e) => log(`[Audio] Decoder error: ${e.message}`));
-                }
-                // Parse AU-Header
-                if (payload.length > 2) {
-                    const auHeadersLenBits = payload.readUInt16BE(0);
-                    const auHeadersLenBytes = Math.ceil(auHeadersLenBits / 8.0);
-                    const headerLen = 2 + auHeadersLenBytes;
-                    if (payload.length > headerLen) {
-                        const aacFrame = payload.slice(headerLen);
-                        const adts = getAdtsHeader(aacFrame.length, track.sampleRateIdx);
-                        track.decoder.stdin.write(Buffer.concat([adts, aacFrame]));
                     }
                 }
             } else {
@@ -418,9 +416,10 @@ function setupTrack(track) {
                 }
                 track.pcmBuffer = track.pcmBuffer || Buffer.alloc(0);
                 track.pcmBuffer = Buffer.concat([track.pcmBuffer, outBuf]);
-                while (track.pcmBuffer.length >= 320) {
-                    const chunk = track.pcmBuffer.slice(0, 320);
-                    track.pcmBuffer = track.pcmBuffer.slice(320);
+                // Send smaller chunks for lower latency (160 bytes = 20ms @ 8kHz 16-bit mono)
+                while (track.pcmBuffer.length >= 160) {
+                    const chunk = track.pcmBuffer.slice(0, 160);
+                    track.pcmBuffer = track.pcmBuffer.slice(160);
                     if (asteriskSocket && !asteriskSocket.destroyed) {
                         const header = Buffer.from([0x10, (chunk.length >> 8) & 0xFF, chunk.length & 0xFF]);
                         asteriskSocket.write(Buffer.concat([header, chunk]));
@@ -444,17 +443,75 @@ const server = net.createServer((socket) => {
     if (rtspSocket) stopRtsp();
     startRtsp();
 
+    // Pre-spawn FFmpeg decoders/encoders to avoid start-up latency
+    for (const track of tracks) {
+        if (track.type === 'audio' && track.codec === 'AAC' && !track.decoder) {
+            log(`[Audio] Pre-starting AAC decoder (ffmpeg)`);
+            track.decoder = spawn(FFMPEG_PATH, [
+                '-fflags', '+nobuffer',
+                '-flags', '+low_delay',
+                '-f', 'aac',
+                '-i', 'pipe:0',
+                '-f', 's16le', '-ac', '1', '-ar', '8000',
+                'pipe:1'
+            ]);
+            track.pcmBuffer = Buffer.alloc(0);
+            track.decoder.stdout.on('data', (pcm) => {
+                if (!asteriskSocket || asteriskSocket.destroyed) return;
+                track.pcmBuffer = Buffer.concat([track.pcmBuffer, pcm]);
+                // Send smaller chunks for lower latency (160 bytes = 20ms @ 8kHz 16-bit mono)
+                while (track.pcmBuffer.length >= 160) {
+                    const chunk = track.pcmBuffer.slice(0, 160);
+                    track.pcmBuffer = track.pcmBuffer.slice(160);
+                    const header = Buffer.from([0x10, (chunk.length >> 8) & 0xFF, chunk.length & 0xFF]);
+                    asteriskSocket.write(Buffer.concat([header, chunk]));
+                    lastSendTime = Date.now();
+                }
+            });
+            track.decoder.on('error', (e) => log(`[Audio] Decoder error: ${e.message}`));
+        } else if (track.type === 'backchannel' && !track.encoder) {
+            log(`[Backchannel] Pre-starting PCMU encoder (ffmpeg)`);
+            track.encoder = spawn(FFMPEG_PATH, [
+                '-fflags', '+nobuffer',
+                '-flags', '+low_delay',
+                '-f', 's16le', '-ar', '8000', '-ac', '1',
+                '-i', 'pipe:0',
+                '-f', 'mulaw', '-ar', '8000', '-ac', '1',
+                'pipe:1'
+            ]);
+            track.encoder.stdout.on('data', (pcmu) => {
+                const rtp = Buffer.alloc(12 + pcmu.length);
+                rtp[0] = 0x80;
+                rtp[1] = 0x00; // PCMU
+                rtp.writeUInt16BE(baseSeq++ & 0xFFFF, 2);
+                rtp.writeUInt32BE(baseTs, 4);
+                rtp.writeUInt32BE(0x12345678, 8);
+                pcmu.copy(rtp, 12);
+
+                if (track.backPkts < 10) {
+                    log(`[Backchannel] Sent RTP pkt #${track.backPkts} ts:${baseTs} len:${pcmu.length}`);
+                }
+                track.backPkts++;
+
+                baseTs += pcmu.length;
+                track.socket.send(rtp, track.remoteRtpPort, track.remoteAddress);
+            });
+            track.encoder.stderr.on('data', (d) => log(`[Backchannel] FFmpeg: ${d.toString().trim()}`));
+            track.encoder.on('error', (e) => log(`[Backchannel] Encoder error: ${e.message}`));
+        }
+    }
+
     if (silenceInterval) clearInterval(silenceInterval);
     silenceInterval = setInterval(() => {
         if (!asteriskSocket || asteriskSocket.destroyed) return;
-        if (Date.now() - lastSendTime > 400) {
-            // Send 320 bytes of silence to keep AudioSocket alive
-            const header = Buffer.from([0x10, 0x01, 0x40]);
-            const silence = Buffer.alloc(320, 0);
+        if (Date.now() - lastSendTime > 200) {
+            // Send 160 bytes of silence to keep AudioSocket alive (reduced from 320 for lower latency)
+            const header = Buffer.from([0x10, 0x00, 0xa0]);
+            const silence = Buffer.alloc(160, 0);
             asteriskSocket.write(Buffer.concat([header, silence]));
             lastSendTime = Date.now();
         }
-    }, 100);
+    }, 50);
 
     socket.on('data', (data) => {
         incomingBuffer = Buffer.concat([incomingBuffer, data]);
@@ -473,37 +530,8 @@ const server = net.createServer((socket) => {
 
             if (type >= 0x10) {
                 const back = tracks.find(t => t.type === 'backchannel');
-                if (back && back.remoteRtpPort) {
-                    if (!back.encoder) {
-                        log(`[Backchannel] Starting PCMU encoder (ffmpeg)`);
-                        back.encoder = spawn(FFMPEG_PATH, [
-                            '-f', 's16le', '-ar', '8000', '-ac', '1',
-                            '-i', 'pipe:0',
-                            '-f', 'mulaw', '-ar', '8000', '-ac', '1',
-                            'pipe:1'
-                        ]);
-                        back.encoder.stdout.on('data', (pcmu) => {
-                            const rtp = Buffer.alloc(12 + pcmu.length);
-                            rtp[0] = 0x80;
-                            rtp[1] = 0x00; // PCMU
-                            rtp.writeUInt16BE(baseSeq++ & 0xFFFF, 2);
-                            rtp.writeUInt32BE(baseTs, 4);
-                            rtp.writeUInt32BE(0x12345678, 8);
-                            pcmu.copy(rtp, 12);
-
-                            if (back.backPkts < 10) {
-                                log(`[Backchannel] Sent RTP pkt #${back.backPkts} ts:${baseTs} len:${pcmu.length}`);
-                            }
-                            back.backPkts++;
-
-                            baseTs += pcmu.length;
-                            back.socket.send(rtp, back.remoteRtpPort, back.remoteAddress);
-                        });
-                        back.encoder.stderr.on('data', (d) => log(`[Backchannel] FFmpeg: ${d.toString().trim()}`));
-                        back.encoder.on('error', (e) => log(`[Backchannel] Encoder error: ${e.message}`));
-                    }
-
-                    // Apply gain before sending to ffmpeg
+                if (back && back.encoder && back.remoteRtpPort) {
+                    // Apply gain before sending to ffmpeg encoder (pre-spawned on connection)
                     const boosted = Buffer.alloc(payload.length);
                     for (let i = 0; i < payload.length / 2; i++) {
                         let val = payload.readInt16LE(i * 2);
